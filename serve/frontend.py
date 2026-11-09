@@ -615,6 +615,10 @@ def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
             kwargs = {"enable_thinking": False}
         elif k == "reasoning_effort" and "enable_thinking" not in kwargs:
             kwargs.update(effort_kwargs(v))
+        elif k == "preserve_thinking":
+            # Qwen3.6's template keeps earlier turns' thinking with it: the next turn's prompt then continues the held
+            # conversation, so the cache serves it (without, the history changes at the first earlier reply)
+            kwargs["preserve_thinking"] = bool(v)
     return _env_to_user(_late_system_to_user(messages)), tools, kwargs
 
 

@@ -3188,8 +3188,63 @@ struct Serve {
     // decode windows of the other slots between two chunks of a prompt read: STRATA_Q36_READ_WINDOWS (default 1; a chunk
     // takes ~0.15 s at 512 tokens, a window ~0.012 s: more windows give the decoding slots more of the time a read takes)
     int read_windows = 1;
+    // the prompt-end checkpoint (single-request path, text only): the recurrent state right after the last prompt was read
+    struct PromptCkpt {
+        bool on = true, valid = false;
+        int sess = -1;
+        std::vector<int32_t> toks;          // the prompt it was taken after
+        std::vector<float*> conv, S;        // pinned host copies, per layer (null for attention layers)
+        float* hlast = nullptr;
+    } ck;
+
+    size_t ck_conv_bytes() const { return (size_t) E.m->g.ssm_conv_channels * (E.m->g.ssm_d_conv - 1) * 4; }
+    size_t ck_S_bytes() const { return (size_t) E.m->g.ssm_v_heads * E.m->g.ssm_state_size * E.m->g.ssm_state_size * 4; }
+    void ck_save(int s_, const std::vector<int32_t>& ids) {
+        if (ck.conv.empty()) {
+            ck.conv.assign(E.conv.size(), nullptr);
+            ck.S.assign(E.S.size(), nullptr);
+            size_t total = 0;
+            for (size_t l = 0; l < E.conv.size(); ++l) {
+                if (!E.conv[l]) continue;
+                CK(cudaMallocHost((void**) &ck.conv[l], ck_conv_bytes()));
+                CK(cudaMallocHost((void**) &ck.S[l], ck_S_bytes()));
+                total += ck_conv_bytes() + ck_S_bytes();
+            }
+            CK(cudaMallocHost((void**) &ck.hlast, (size_t) E.m->g.n_embd * 4));
+            std::fprintf(stderr, "strata-q36: prompt-end checkpoint on (%.1f MiB of pinned host memory)\n", (double) total / (1 << 20));
+        }
+        for (size_t l = 0; l < E.conv.size(); ++l) {
+            if (!E.conv[l]) continue;
+            CK(cudaMemcpyAsync(ck.conv[l], E.conv[l], ck_conv_bytes(), cudaMemcpyDeviceToHost, E.st));
+            CK(cudaMemcpyAsync(ck.S[l], E.S[l], ck_S_bytes(), cudaMemcpyDeviceToHost, E.st));
+        }
+        CK(cudaMemcpyAsync(ck.hlast, E.hlast, (size_t) E.m->g.n_embd * 4, cudaMemcpyDeviceToHost, E.st));
+        CK(cudaStreamSynchronize(E.st));
+        ck.toks = ids;
+        ck.sess = s_;
+        ck.valid = true;
+    }
+    /// Restores the checkpoint into the current session when `ids` continues its prompt; returns the cells reused.
+    size_t ck_restore(Engine::Sess& ss, const std::vector<int32_t>& ids) {
+        const size_t L = ck.toks.size();
+        if (!ck.valid || ck.sess != E.cur || L == 0 || L >= ids.size() || !ss.imgs.empty() ||
+            !std::equal(ck.toks.begin(), ck.toks.end(), ids.begin()))
+            return 0;
+        for (size_t l = 0; l < E.conv.size(); ++l) {
+            if (!E.conv[l]) continue;
+            CK(cudaMemcpyAsync(E.conv[l], ck.conv[l], ck_conv_bytes(), cudaMemcpyHostToDevice, E.st));
+            CK(cudaMemcpyAsync(E.S[l], ck.S[l], ck_S_bytes(), cudaMemcpyHostToDevice, E.st));
+        }
+        CK(cudaMemcpyAsync(E.hlast, ck.hlast, (size_t) E.m->g.n_embd * 4, cudaMemcpyHostToDevice, E.st));
+        CK(cudaStreamSynchronize(E.st));
+        E.pos = (int64_t) L;
+        ss.pos = (int64_t) L;
+        ss.live.assign(ids.begin(), ids.begin() + (long) L);
+        return L;
+    }
 
     explicit Serve(Engine& e) : E(e), slots((size_t) e.n_sess) {
+        if (const char* v = std::getenv("STRATA_Q36_PROMPT_CKPT")) ck.on = std::string(v) != "0";
         if (const char* v = std::getenv("STRATA_Q36_READ_WINDOWS")) read_windows = std::max(0, std::min(64, std::atoi(v)));
     }
 
@@ -3533,6 +3588,13 @@ struct Serve {
             }
         }
         E.select(s);
+        const bool ck_path = ck.on && !adm && E.n_sess == 1 && !geni;
+        if (reuse == 0 && ck_path) {
+            reuse = ck_restore(ss, ids);
+            if (reuse > 0)
+                std::fprintf(stderr, "strata-q36: prompt-end checkpoint: %zu tokens restored\n", reuse);
+        }
+        if (reuse < ck.toks.size()) ck.valid = false;   // the cells below the checkpoint's end are read again
         if (reuse == 0) {
             E.reset();
             ss.live.clear();
@@ -3576,6 +3638,7 @@ struct Serve {
             std::fflush(stdout);
             return;
         }
+        if (ck_path && got == fresh) ck_save(s, ids);
         std::mt19937_64 rng(smp.seed);
         // #4590: the penalties count the reply's tokens (and the fed-back last prompt token), not the prompt; STRATA_PENALTY_PROMPT=1
         // restores the old window.  `ids` is the request's full prompt whether or not the session was resumed.

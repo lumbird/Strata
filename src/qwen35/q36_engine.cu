@@ -3191,6 +3191,7 @@ struct Serve {
     // the prompt-end checkpoint (single-request path, text only): the recurrent state right after the last prompt was read
     struct PromptCkpt {
         bool on = true, valid = false;
+        int32_t token = 248045;             // the turn marker it is taken in front of (Qwen's <|im_start|>)
         int sess = -1;
         std::vector<int32_t> toks;          // the prompt it was taken after
         std::vector<float*> conv, S;        // pinned host copies, per layer (null for attention layers)
@@ -3245,6 +3246,7 @@ struct Serve {
 
     explicit Serve(Engine& e) : E(e), slots((size_t) e.n_sess) {
         if (const char* v = std::getenv("STRATA_Q36_PROMPT_CKPT")) ck.on = std::string(v) != "0";
+        if (const char* v = std::getenv("STRATA_Q36_CKPT_TOKEN")) ck.token = (int32_t) std::atoi(v);
         if (const char* v = std::getenv("STRATA_Q36_READ_WINDOWS")) read_windows = std::max(0, std::min(64, std::atoi(v)));
     }
 
@@ -3605,7 +3607,14 @@ struct Serve {
         const auto t0 = Clock::now();
         const int64_t fresh = (int64_t) (ids.size() - reuse);
         bool cancelled = false;
-        const int64_t got = E.process(ids.data() + reuse, fresh, [&](int64_t done) -> bool {
+        // the checkpoint's ck_cut: the prompt's last turn marker, when it lies inside the part read now
+        int64_t ck_cut = 0;
+        if (ck_path)
+            for (int64_t i = (int64_t) ids.size() - 1; i > (int64_t) reuse; --i)
+                if (ids[(size_t) i] == ck.token) { ck_cut = i; break; }
+        int64_t done_before = 0;   // what the first part of a split read already did (progress lines count the whole)
+        auto on_chunk = [&](int64_t done_part) -> bool {
+            const int64_t done = done_before + done_part;
             std::printf("PP %lld %lld %.0f %.1f\n", (long long) done, (long long) fresh, ms_since(t0),
                         (double) done / std::max(1e-9, ms_since(t0) / 1000.0));
             std::fflush(stdout);
@@ -3618,7 +3627,19 @@ struct Serve {
             }
             if (stop.load() && done < fresh) { cancelled = true; return false; }
             return true;
-        });
+        };
+        int64_t got = 0;
+        if (ck_cut > 0) {
+            const int64_t head = ck_cut - (int64_t) reuse;
+            got = E.process(ids.data() + reuse, head, on_chunk);
+            if (got == head && !cancelled) {
+                ck_save(s, std::vector<int32_t>(ids.begin(), ids.begin() + (long) ck_cut));
+                done_before = got;
+                got += E.process(ids.data() + ck_cut, fresh - head, on_chunk);
+            }
+        } else {
+            got = E.process(ids.data() + reuse, fresh, on_chunk);
+        }
         ss.live.insert(ss.live.end(), ids.begin() + (long) reuse, ids.begin() + (long) reuse + (long) got);
         ss.imgs.clear();
         bool cut = false;
@@ -3638,7 +3659,6 @@ struct Serve {
             std::fflush(stdout);
             return;
         }
-        if (ck_path && got == fresh) ck_save(s, ids);
         std::mt19937_64 rng(smp.seed);
         // #4590: the penalties count the reply's tokens (and the fed-back last prompt token), not the prompt; STRATA_PENALTY_PROMPT=1
         // restores the old window.  `ids` is the request's full prompt whether or not the session was resumed.

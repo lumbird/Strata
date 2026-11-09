@@ -754,6 +754,12 @@ def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[d
         # A config's reasoning_effort still applies: Service.with_shared sets output_config before this runs.  A
         # request that gives its own reasoning_budget_tokens (#123) asks for thinking, so it thinks as before.
         kwargs["enable_thinking"] = False
+    # A client that sends its thinking back with the history (Anthropic's convention; Claude Code does) gets it kept in
+    # the earlier turns too (Qwen3.6's preserve_thinking): the next turn then continues the held conversation, so the
+    # cache serves it instead of reading it again from the first earlier reply.  STRATA_PRESERVE_RETURNED_THINKING=0: off.
+    if os.environ.get("STRATA_PRESERVE_RETURNED_THINKING", "1") != "0" and kwargs.get("enable_thinking") is not False and \
+            any(x.get("role") == "assistant" and x.get("reasoning_content") for x in messages):
+        kwargs["preserve_thinking"] = True
     return _env_to_user(_late_system_to_user(messages)), tools, kwargs
 
 
